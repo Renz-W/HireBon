@@ -218,7 +218,7 @@ if __name__ == "__main__":
             print("\nADMIN LOGIN URL (this session only):")
             print(f"http://127.0.0.1:5000/admin/login/{fresh_token}")
             print("\nADMIN CREDENTIALS:")
-            print("Username: admin")
+            print("Account: admin@gmail.com")
             print("Password: admin123")
             print("=" * 50 + "\n")
 
