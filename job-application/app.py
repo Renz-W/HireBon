@@ -167,6 +167,7 @@ def check_user_ban():
 from routes.auth import auth_bp
 from routes.applicant import applicant_bp
 from routes.recruiter import recruiter_bp
+import routes.recruiter_hr_accounts   # registers HR-account routes onto recruiter_bp — must be imported before register_blueprint below
 from routes.hr import hr_bp
 from routes.admin import admin_bp
 from routes.chat import chat_bp
