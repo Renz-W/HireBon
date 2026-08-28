@@ -17,7 +17,6 @@
 
 import os
 
-
 # ----------------------------------------------------------------
 # Application status — single canonical (lowercase) value per state.
 # Old code did things like:
