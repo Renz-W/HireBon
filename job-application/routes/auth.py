@@ -11,6 +11,10 @@ import secrets
 import random
 from datetime import date, datetime, timedelta
 
+# ── FIX #4: centralized config instead of a hardcoded string
+# buried in an f-string ("http://127.0.0.1:5000/login").
+from config.constants import SiteConfig
+
 auth_bp = Blueprint("auth", __name__)
 
 
@@ -48,26 +52,64 @@ def redirect_by_role(user):
     return redirect(url_for("auth.index"))
 
 
+# ==============================================================
+# FIX #5: safe wrapper for admin notifications
+#
+# BEFORE: every call site that pushes an admin notification during
+#   registration wrapped it in a bare `try: ... except: pass`,
+#   meaning a bug in push_admin_notif() itself was invisible — no
+#   log line, no trace, nothing. This same block was copy-pasted at
+#   three separate spots in this file alone.
+#
+# AFTER: one helper that still never blocks the primary action
+#   (registration must succeed even if the notification insert
+#   fails) but logs the failure with a full traceback so it shows
+#   up wherever the app's logging is actually configured to go.
+# ==============================================================
+def push_admin_notif_safe(notif_type, message, user_id=None):
+    try:
+        from routes.admin import push_admin_notif
+        push_admin_notif(notif_type, message, user_id=user_id)
+    except Exception:
+        current_app.logger.exception(
+            f"[push_admin_notif_safe] failed to push notif type={notif_type} user_id={user_id}"
+        )
+
+
 # =========================
 # SEND VERIFICATION EMAIL
 # =========================
 def send_verification_email(user):
+    """
+    FIX #5 + #4:
+      - BEFORE: caught Exception and used print(), so a broken mail
+        server failed completely silently in production.
+      - BEFORE: hardcoded "http://127.0.0.1:5000/login" in the email
+        body, which would still point recruiters at localhost after
+        a real deployment.
+      - AFTER: logs with current_app.logger.exception() (keeps the
+        traceback), and builds the login URL from SiteConfig.BASE_URL,
+        which reads the SITE_BASE_URL environment variable in
+        production and only falls back to localhost for local dev.
+    """
+    if user.role != "recruiter":
+        return
+
     try:
         from app import mail
 
-        if user.role == "recruiter":
-            subject = "Your Recruiter Account Has Been Verified – Job Portal"
-            body = f"""Hello {user.username},
+        login_url = f"{SiteConfig.BASE_URL}/login"
+
+        subject = "Your Recruiter Account Has Been Verified – Job Portal"
+        body = f"""Hello {user.username},
 
 Great news! Your recruiter account has been reviewed and approved by our admin team.
 
-You can now log in and start posting jobs at: http://127.0.0.1:5000/login
+You can now log in and start posting jobs at: {login_url}
 
 Welcome to Job Portal!
 
 – The Job Portal Team"""
-        else:
-            return
 
         msg = Message(
             subject=subject,
@@ -76,8 +118,10 @@ Welcome to Job Portal!
         )
         mail.send(msg)
 
-    except Exception as e:
-        print(f"Failed to send verification email to {user.email}: {e}")
+    except Exception:
+        current_app.logger.exception(
+            f"Failed to send verification email to user_id={user.id} email={user.email}"
+        )
 
 
 # =========================
@@ -125,8 +169,9 @@ def _send_2fa_email(to_email: str, username: str, pin: str):
         </div>
         """
         mail.send(msg)
-    except Exception as e:
-        print(f"[2FA] Failed to send email to {to_email}: {e}")
+    except Exception:
+        # FIX #5: logged with traceback instead of print().
+        current_app.logger.exception(f"[2FA] Failed to send email to {to_email}")
 
 
 # =========================
@@ -465,15 +510,12 @@ def google_role_select():
             db.session.add(applicant_profile)
             db.session.commit()
 
-            try:
-                from routes.admin import push_admin_notif
-                push_admin_notif(
-                    "account_request",
-                    f"New applicant account registered via Google: <strong>{user.username}</strong>",
-                    user_id=user.id,
-                )
-            except Exception:
-                pass
+            # FIX #5: was a bare try/except: pass — now logs failures.
+            push_admin_notif_safe(
+                "account_request",
+                f"New applicant account registered via Google: <strong>{user.username}</strong>",
+                user_id=user.id,
+            )
 
             login_user(user)
             flash("Account created with Google! Please complete your profile to unlock all features.", "success")
@@ -497,15 +539,12 @@ def google_role_select():
             db.session.add(profile)
             db.session.commit()
 
-            try:
-                from routes.admin import push_admin_notif
-                push_admin_notif(
-                    "account_request",
-                    f"New recruiter account registered via Google: <strong>{user.username}</strong>",
-                    user_id=user.id,
-                )
-            except Exception:
-                pass
+            # FIX #5: was a bare try/except: pass — now logs failures.
+            push_admin_notif_safe(
+                "account_request",
+                f"New recruiter account registered via Google: <strong>{user.username}</strong>",
+                user_id=user.id,
+            )
 
             login_user(user)
             flash("Account created! Complete your company profile, then submit for admin verification.", "info")
@@ -577,15 +616,12 @@ def register():
         db.session.add(user)
         db.session.commit()
 
-        try:
-            from routes.admin import push_admin_notif
-            push_admin_notif(
-                'account_request',
-                f'New {user.role} account registered: <strong>{user.username}</strong>',
-                user_id=user.id
-            )
-        except:
-            pass
+        # FIX #5: was `try: ... except: pass` — now logs failures.
+        push_admin_notif_safe(
+            'account_request',
+            f'New {user.role} account registered: <strong>{user.username}</strong>',
+            user_id=user.id
+        )
 
         # =========================
         # APPLICANT
@@ -700,19 +736,30 @@ def forgot_password():
 
             reset_url = url_for("auth.reset_password", token=token, _external=True)
 
-            from app import mail
-            msg = Message(
-                subject="Reset Your Password – Job Portal",
-                recipients=[email],
-                body=(
-                    f"Hello {user.username},\n\n"
-                    f"Click the link below to reset your password. "
-                    f"It expires in 30 minutes.\n\n"
-                    f"{reset_url}\n\n"
-                    f"If you did not request this, you can safely ignore this email."
+            try:
+                from app import mail
+                msg = Message(
+                    subject="Reset Your Password – Job Portal",
+                    recipients=[email],
+                    body=(
+                        f"Hello {user.username},\n\n"
+                        f"Click the link below to reset your password. "
+                        f"It expires in 30 minutes.\n\n"
+                        f"{reset_url}\n\n"
+                        f"If you did not request this, you can safely ignore this email."
+                    )
                 )
-            )
-            mail.send(msg)
+                mail.send(msg)
+            except Exception:
+                # FIX #5: previously this send() call wasn't wrapped at
+                # all, so a mail server outage would 500 the whole
+                # request and leak a stack trace to the user. Now it's
+                # logged server-side and the user still gets the same
+                # generic "if that email is registered..." message
+                # below, matching the no-leak intent of that message.
+                current_app.logger.exception(
+                    f"Failed to send password reset email to {email}"
+                )
 
         # Always show the same generic message to avoid leaking whether an email exists
         flash("If that email is registered, a reset link has been sent.", "info")
