@@ -1,8 +1,4 @@
 # ================================================================
-# config/constants.py
-#
-# FIX #4 — "Hard-coded Magic Numbers/Strings/Config"
-#
 # BEFORE: status strings like 'pending' / 'Pending' / 'accepted' /
 #   'Job Removed' were typed out independently in admin.py, hr.py,
 #   recruiter.py, applicant.py, employment.py — with inconsistent
@@ -20,7 +16,6 @@
 # ================================================================
 
 import os
-
 
 # ----------------------------------------------------------------
 # Application status — single canonical (lowercase) value per state.
