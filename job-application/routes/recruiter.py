@@ -22,7 +22,7 @@ import os
 import uuid
 import json
 
-# ── FIX #1 / #3: shared deletion logic (see services/deletion_service.py)
+# FIX: shared deletion logic (see services/deletion_service.py)
 # replaces the ~120-line duplicated raw-SQL block that used to live in
 # force_delete_job() below.
 from services.deletion_service import delete_job_completely
