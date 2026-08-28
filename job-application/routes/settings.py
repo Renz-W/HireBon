@@ -9,13 +9,12 @@ from models import db, UserSettings
 from werkzeug.security import check_password_hash, generate_password_hash
 import json
 
-# ── FIX #1 / #3: shared deletion logic instead of ~250 lines of
+# FIX: Shared deletion logic instead of ~250 lines of
 # duplicated helper functions (nearly identical to admin.py's copy).
 # See services/deletion_service.py for the single source of truth.
 from services.deletion_service import delete_user_completely
 
 settings_bp = Blueprint('settings', __name__, url_prefix='/settings')
-
 
 # ─────────────────────────────────────────────────────────────
 #  Allowed roles helper
