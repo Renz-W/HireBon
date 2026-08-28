@@ -385,7 +385,7 @@ def unban_user(user_id):
 # ==============================================================
 # DELETE Banned User permanently
 #
-# ── FIX #1 / #3 ──────────────────────────────────────────────
+# ── FIX ──────────────────────────────────────────────
 # BEFORE: this route contained ~230 lines defining
 #   _delete_job_image_files(), _delete_job_rows(), and an inline
 #   delete_user() body with _delete_upload(), _delete_user_files(),
@@ -523,7 +523,7 @@ def _delete_report_evidence(report):
             try:
                 os.remove(path)
             except Exception as e:
-                # FIX #5: use the app logger instead of print(), so this
+                # FIX: use the app logger instead of print(), so this
                 # is visible wherever the app's logging/error tracking
                 # is actually configured to send output.
                 current_app.logger.warning(f'[DELETE FILE] report evidence: {path}: {e}')
@@ -965,7 +965,7 @@ def restore_job(job_id):
 # ==============================================================
 # Job Moderation: Permanent Delete
 #
-# ── FIX #1 / #3 ──────────────────────────────────────────────
+# ── FIX ──────────────────────────────────────────────
 # BEFORE: this route rebuilt job-deletion logic AGAIN (a third
 #   copy, alongside admin.delete_user()'s internal job-deletion
 #   loop and recruiter.py's force_delete_job()).

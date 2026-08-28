@@ -31,7 +31,7 @@ from services.deletion_service import delete_job_completely
 recruiter_bp = Blueprint('recruiter', __name__, url_prefix="/recruiter")
 
 # ==============================================================
-# FIX #2 — God Object / Large File
+# FIX — God Object / Large File
 #
 # BEFORE: this file also defined generate_temp_password() and the
 #   full HR-account lifecycle — hr_accounts(), create_hr(),
@@ -1273,7 +1273,7 @@ def delete_job_image(image_id):
 # ==============================================================
 # DELETE JOB — with active-applications guard
 #
-# ── FIX #1 / #3 ──────────────────────────────────────────────
+# ── FIX ──────────────────────────────────────────────
 # BEFORE: manually removed gallery images / cover photo, then
 #   called db.session.delete(job) directly, relying on SQLAlchemy
 #   cascade config to clean up the rest — inconsistent with the
@@ -1327,7 +1327,7 @@ def delete_job(job_id):
 # ==============================================================
 # FORCE DELETE JOB  (AJAX)
 #
-# ── FIX #1 / #3 ──────────────────────────────────────────────
+# ── FIX ──────────────────────────────────────────────
 # BEFORE: ~120 lines of raw SQL duplicating the same 13-step FK
 #   cleanup that admin.py's job-deletion path (inside delete_user())
 #   already implemented independently.

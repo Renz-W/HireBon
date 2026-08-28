@@ -11,7 +11,7 @@ import secrets
 import random
 from datetime import date, datetime, timedelta
 
-# ── FIX #4: centralized config instead of a hardcoded string
+# FIX: centralized config instead of a hardcoded string
 # buried in an f-string ("http://127.0.0.1:5000/login").
 from config.constants import SiteConfig
 
@@ -53,7 +53,7 @@ def redirect_by_role(user):
 
 
 # ==============================================================
-# FIX #5: safe wrapper for admin notifications
+# FIX: safe wrapper for admin notifications
 #
 # BEFORE: every call site that pushes an admin notification during
 #   registration wrapped it in a bare `try: ... except: pass`,
@@ -81,7 +81,7 @@ def push_admin_notif_safe(notif_type, message, user_id=None):
 # =========================
 def send_verification_email(user):
     """
-    FIX #5 + #4:
+    FIX:
       - BEFORE: caught Exception and used print(), so a broken mail
         server failed completely silently in production.
       - BEFORE: hardcoded "http://127.0.0.1:5000/login" in the email
@@ -170,7 +170,7 @@ def _send_2fa_email(to_email: str, username: str, pin: str):
         """
         mail.send(msg)
     except Exception:
-        # FIX #5: logged with traceback instead of print().
+        # FIX: logged with traceback instead of print().
         current_app.logger.exception(f"[2FA] Failed to send email to {to_email}")
 
 
@@ -510,7 +510,7 @@ def google_role_select():
             db.session.add(applicant_profile)
             db.session.commit()
 
-            # FIX #5: was a bare try/except: pass — now logs failures.
+            # FIX: was a bare try/except: pass — now logs failures.
             push_admin_notif_safe(
                 "account_request",
                 f"New applicant account registered via Google: <strong>{user.username}</strong>",
@@ -539,7 +539,7 @@ def google_role_select():
             db.session.add(profile)
             db.session.commit()
 
-            # FIX #5: was a bare try/except: pass — now logs failures.
+            # FIX: was a bare try/except: pass — now logs failures.
             push_admin_notif_safe(
                 "account_request",
                 f"New recruiter account registered via Google: <strong>{user.username}</strong>",
@@ -616,7 +616,7 @@ def register():
         db.session.add(user)
         db.session.commit()
 
-        # FIX #5: was `try: ... except: pass` — now logs failures.
+        # FIX: was `try: ... except: pass` — now logs failures.
         push_admin_notif_safe(
             'account_request',
             f'New {user.role} account registered: <strong>{user.username}</strong>',
@@ -751,7 +751,7 @@ def forgot_password():
                 )
                 mail.send(msg)
             except Exception:
-                # FIX #5: previously this send() call wasn't wrapped at
+                # FIX: previously this send() call wasn't wrapped at
                 # all, so a mail server outage would 500 the whole
                 # request and leak a stack trace to the user. Now it's
                 # logged server-side and the user still gets the same

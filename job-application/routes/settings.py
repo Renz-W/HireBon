@@ -144,7 +144,7 @@ def save_settings():
                                 followed_id=current_user.id
                             ))
             except Exception:
-                # FIX #5: was `except Exception as e: print(...)` — now
+                # FIX: was `except Exception as e: print(...)` — now
                 # goes through the app logger with a full traceback so
                 # it's visible in production monitoring, not just a
                 # local console that nobody's watching.
@@ -218,7 +218,7 @@ def save_settings():
         return jsonify({'success': True})
     except Exception:
         db.session.rollback()
-        # FIX #5: was print(traceback) via `import traceback; traceback.print_exc()`
+        # FIX: was print(traceback) via `import traceback; traceback.print_exc()`
         # — now logged through current_app.logger so it goes wherever the
         # rest of the app's logging is actually configured to go.
         current_app.logger.exception(
@@ -266,7 +266,7 @@ def deactivate_account():
 # ==============================================================
 #  POST /settings/delete-account
 #
-# ── FIX #1 / #3 ──────────────────────────────────────────────
+# ── FIX ──────────────────────────────────────────────
 # BEFORE: ~250 lines of nested helper functions
 #   (_delete_upload, _delete_user_files, _delete_job_files, _run,
 #   _delete_user_data) almost identical to admin.py's delete_user()
