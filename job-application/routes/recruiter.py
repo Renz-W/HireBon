@@ -11,7 +11,7 @@ from datetime import datetime, date
 from models import (
     db, Job, User, Application, JobImage, HRFeedback,
     RecruiterNotification, ApplicantNotification, RecruiterEducation,
-    JobTeamMember, HRProfile, RecruiterProfile, Employee, get_ph_time  # ← add get_ph_time
+    JobTeamMember, HRProfile, RecruiterProfile, Employee, get_ph_time
 )
 from PIL import Image
 import base64
@@ -22,13 +22,32 @@ import os
 import uuid
 import json
 
-
-def generate_temp_password(length=10):
-    characters = string.ascii_letters + string.digits
-    return ''.join(secrets.choice(characters) for _ in range(length))
+# ── FIX #1 / #3: shared deletion logic (see services/deletion_service.py)
+# replaces the ~120-line duplicated raw-SQL block that used to live in
+# force_delete_job() below.
+from services.deletion_service import delete_job_completely
 
 
 recruiter_bp = Blueprint('recruiter', __name__, url_prefix="/recruiter")
+
+# ==============================================================
+# FIX #2 — God Object / Large File
+#
+# BEFORE: this file also defined generate_temp_password() and the
+#   full HR-account lifecycle — hr_accounts(), create_hr(),
+#   soft_delete_hr(), soft_delete_all_hr(), undo_delete_hr(),
+#   undo_delete_all_hr(), commit_delete_hr(), commit_delete_all_hr()
+#   — about 230 unrelated lines mixed in with job posting, job
+#   editing, and application review logic.
+#
+# AFTER: all of that now lives in routes/recruiter_hr_accounts.py,
+#   which attaches its routes to THIS SAME recruiter_bp object (see
+#   that file's docstring for why — it keeps every existing
+#   url_for('recruiter.hr_accounts') call in your templates working
+#   with zero template changes). app.py must import that module so
+#   its @recruiter_bp.route(...) registrations actually run — see
+#   the note at the bottom of recruiter_hr_accounts.py.
+# ==============================================================
 
 
 # ===============================
@@ -180,8 +199,10 @@ def submit_for_review():
             f'Recruiter <strong>{current_user.username}</strong> has submitted their profile for verification.',
             user_id=current_user.id
         )
-    except:
-        pass
+    except Exception:
+        current_app.logger.exception(
+            f"[submit_for_review] failed to push admin notif for user_id={current_user.id}"
+        )
 
     db.session.commit()
 
@@ -630,7 +651,7 @@ def post_job():
         cover_file.save(os.path.join(upload_folder, unique_name))
         job.cover_photo = unique_name
 
-    # ── Gallery images ─��──────────────────────────────────────────
+    # ── Gallery images ──
     poster_files = request.files.getlist("posters")
     upload_folder = os.path.join(current_app.root_path, "static", "uploads", "job_posters")
     os.makedirs(upload_folder, exist_ok=True)
@@ -700,276 +721,6 @@ def my_job_list():
         current_date=date.today(),
         job_active_counts=job_active_counts
     )
-
-
-# ===============================
-# HR ACCOUNTS PAGE
-# ===============================
-@recruiter_bp.route('/hr-accounts')
-@login_required
-def hr_accounts():
-    banned = check_banned()
-    if banned:
-        return banned
-
-    if current_user.role != 'recruiter':
-        flash("Access denied!", "danger")
-        return redirect(url_for('auth.index'))
-
-    if not current_user.is_verified:
-        flash("Your account must be verified to manage HR accounts.", "warning")
-        return redirect(url_for('recruiter.profile'))
-
-    # Session-based temp password flow
-    temp_password = session.pop('temp_password', None)
-
-    hrs = User.query.filter_by(
-        created_by=current_user.id,
-        role="hr",
-        is_deleted=False,
-        is_banned=False
-    ).all()
-
-    return render_template("recruiter/hr_accounts.html", hrs=hrs, temp_password=temp_password)
-
-
-# ===============================
-# CREATE HR ACCOUNT
-# ===============================
-@recruiter_bp.route('/create-hr', methods=['POST'])
-@login_required
-def create_hr():
-    banned = check_banned()
-    if banned:
-        return banned
-
-    if current_user.role != 'recruiter':
-        flash("Access denied!", "danger")
-        return redirect(url_for('auth.index'))
-
-    if not current_user.is_verified:
-        flash("Your account must be verified to create HR accounts.", "warning")
-        return redirect(url_for('recruiter.profile'))
-
-    username = request.form.get('username')
-    email    = request.form.get('email')
-
-    # Check against active (non-deleted) users only
-    existing_username = User.query.filter_by(username=username, is_deleted=False).first()
-    if existing_username:
-        flash("Username already exists. Please choose another.", "danger")
-        return redirect(url_for('recruiter.hr_accounts'))
-
-    existing_email = User.query.filter_by(email=email, is_deleted=False).first()
-    if existing_email:
-        flash("Email is already registered.", "danger")
-        return redirect(url_for('recruiter.hr_accounts'))
-
-    temp_password = generate_temp_password()
-
-    # Reuse soft-deleted row if username or email matches one
-    ghost = User.query.filter(
-        User.is_deleted == True,
-        db.or_(User.username == username, User.email == email)
-    ).first()
-
-    if ghost:
-        # Overwrite the old soft-deleted record in-place
-        ghost.username             = username
-        ghost.email                = email
-        ghost.password             = generate_password_hash(temp_password)
-        ghost.role                 = 'hr'
-        ghost.created_by           = current_user.id
-        ghost.must_change_password = True
-        ghost.is_deleted           = False
-        ghost.deleted_at           = None
-        ghost.deleted_by           = None
-        ghost.is_banned            = False
-        ghost.ban_reason           = None
-        ghost.banned_at            = None
-        ghost.ban_until            = None
-        ghost.is_verified          = False
-        ghost.verification_status  = 'Pending'
-        ghost.profile_completed    = False
-        ghost.profile_picture      = None
-        ghost.reset_token          = None
-        ghost.reset_token_expiry   = None
-        ghost.created_at           = get_ph_time()
-
-        # Also wipe the old HR profile if one exists
-        old_profile = HRProfile.query.filter_by(user_id=ghost.id).first()
-        if old_profile:
-            db.session.delete(old_profile)
-            db.session.flush()
-
-        db.session.commit()
-    else:
-        new_hr = User(
-            username=username,
-            email=email,
-            password=generate_password_hash(temp_password),
-            role="hr",
-            created_by=current_user.id,
-            must_change_password=True
-        )
-        db.session.add(new_hr)
-        db.session.commit()
-
-    session['temp_password'] = temp_password
-    return redirect(url_for('recruiter.hr_accounts'))
-
-
-# ================================================================
-# SOFT-DELETE / UNDO-DELETE / COMMIT-DELETE HR
-# ================================================================
-
-@recruiter_bp.route('/soft-delete-hr/<int:hr_id>', methods=['POST'])
-@login_required
-def soft_delete_hr(hr_id):
-    if current_user.role != 'recruiter':
-        return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-    hr = User.query.filter_by(id=hr_id, role='hr', created_by=current_user.id, is_deleted=False).first()
-    if not hr:
-        return jsonify({'success': False, 'error': 'HR account not found'}), 404
-
-    hr.is_deleted = True
-    hr.deleted_at = get_ph_time()
-    hr.deleted_by = current_user.id
-    db.session.commit()
-
-    return jsonify({'success': True, 'hr_id': hr_id})
-
-
-@recruiter_bp.route('/soft-delete-all-hr', methods=['POST'])
-@login_required
-def soft_delete_all_hr():
-    if current_user.role != 'recruiter':
-        return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-    hrs = User.query.filter_by(created_by=current_user.id, role='hr', is_deleted=False).all()
-    if not hrs:
-        return jsonify({'success': True, 'deleted_ids': []})
-
-    now = get_ph_time()
-    deleted_ids = []
-    for hr in hrs:
-        hr.is_deleted = True
-        hr.deleted_at = now
-        hr.deleted_by = current_user.id
-        deleted_ids.append(hr.id)
-
-    db.session.commit()
-    return jsonify({'success': True, 'deleted_ids': deleted_ids})
-
-
-@recruiter_bp.route('/undo-delete-hr/<int:hr_id>', methods=['POST'])
-@login_required
-def undo_delete_hr(hr_id):
-    if current_user.role != 'recruiter':
-        return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-    hr = User.query.filter_by(id=hr_id, role='hr', created_by=current_user.id, is_deleted=True).first()
-    if not hr:
-        return jsonify({'success': False, 'error': 'HR account not found or already committed'}), 404
-
-    hr.is_deleted = False
-    hr.deleted_at = None
-    hr.deleted_by = None
-    db.session.commit()
-
-    return jsonify({'success': True})
-
-
-@recruiter_bp.route('/undo-delete-all-hr', methods=['POST'])
-@login_required
-def undo_delete_all_hr():
-    if current_user.role != 'recruiter':
-        return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-    data = request.get_json(silent=True) or {}
-    ids  = data.get('ids', [])
-
-    if not ids:
-        return jsonify({'success': False, 'error': 'No IDs provided'}), 400
-
-    restored = 0
-    for hr_id in ids:
-        hr = User.query.filter_by(id=hr_id, role='hr', created_by=current_user.id, is_deleted=True).first()
-        if hr:
-            hr.is_deleted = False
-            hr.deleted_at = None
-            hr.deleted_by = None
-            restored += 1
-
-    db.session.commit()
-    return jsonify({'success': True, 'restored': restored})
-
-
-@recruiter_bp.route('/commit-delete-hr/<int:hr_id>', methods=['POST'])
-@login_required
-def commit_delete_hr(hr_id):
-    if current_user.role != 'recruiter':
-        return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-    hr = User.query.filter_by(id=hr_id, role='hr', created_by=current_user.id, is_deleted=True).first()
-    if not hr:
-        return jsonify({'success': True, 'skipped': True})
-
-    try:
-        from sqlalchemy import text
-        db.session.execute(text("DELETE FROM hr_feedback WHERE hr_id = :hr_id"), {"hr_id": hr.id})
-        db.session.flush()
-
-        if hr.hr_profile:
-            db.session.delete(hr.hr_profile)
-            db.session.flush()
-
-        db.session.delete(hr)
-        db.session.commit()
-        return jsonify({'success': True})
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-
-@recruiter_bp.route('/commit-delete-all-hr', methods=['POST'])
-@login_required
-def commit_delete_all_hr():
-    if current_user.role != 'recruiter':
-        return jsonify({'success': False, 'error': 'Access denied'}), 403
-
-    data = request.get_json(silent=True) or {}
-    ids  = data.get('ids', [])
-
-    if not ids:
-        return jsonify({'success': True, 'message': 'Nothing to commit'})
-
-    try:
-        from sqlalchemy import text
-
-        for hr_id in ids:
-            hr = User.query.filter_by(id=hr_id, role='hr', created_by=current_user.id, is_deleted=True).first()
-            if not hr:
-                continue
-
-            db.session.execute(text("DELETE FROM hr_feedback WHERE hr_id = :hr_id"), {"hr_id": hr_id})
-            db.session.flush()
-
-            if hr.hr_profile:
-                db.session.delete(hr.hr_profile)
-                db.session.flush()
-
-            db.session.delete(hr)
-            db.session.flush()
-
-        db.session.commit()
-        return jsonify({'success': True})
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ===============================
@@ -1045,7 +796,7 @@ def archived_applications(job_id):
     ).order_by(Application.created_at.desc()).all()
  
     return render_template(
-        "shared/archived_applications.html",   # put the template in templates/shared/
+        "shared/archived_applications.html",
         job=job,
         archived_applications=archived_applications,
         back_url=url_for('recruiter.view_job_applications', job_id=job_id),
@@ -1411,7 +1162,6 @@ def add_job_team_member(job_id):
     data  = request.get_json(silent=True) or {}
     hr_id = data.get('hr_id')
 
-    # ── FIX: cast to int, guard against missing/invalid value ──
     try:
         hr_id = int(hr_id)
     except (TypeError, ValueError):
@@ -1520,9 +1270,23 @@ def delete_job_image(image_id):
     return jsonify({'success': True})
 
 
-# ===============================
+# ==============================================================
 # DELETE JOB — with active-applications guard
-# ===============================
+#
+# ── FIX #1 / #3 ──────────────────────────────────────────────
+# BEFORE: manually removed gallery images / cover photo, then
+#   called db.session.delete(job) directly, relying on SQLAlchemy
+#   cascade config to clean up the rest — inconsistent with the
+#   raw-SQL approach used everywhere else in this app, and easy to
+#   get out of sync with the FK chain if cascades aren't configured
+#   for every table.
+# AFTER: same "block if there are active applications, unless
+#   forced" guard (kept here since it's specific to the recruiter-
+#   initiated delete flow), but the actual deletion now goes
+#   through delete_job_completely() so it's guaranteed to match the
+#   exact same FK-safe order used by admin.py and force_delete_job()
+#   below.
+# ==============================================================
 @recruiter_bp.route('/delete-job/<int:job_id>', methods=['POST'])
 @login_required
 def delete_job(job_id):
@@ -1540,7 +1304,6 @@ def delete_job(job_id):
         flash("Unauthorized action!", "danger")
         return redirect(url_for('recruiter.job_posting'))
 
-    # ── Guard: block deletion if active applications exist ──
     force = request.form.get('force_delete') == '1'
     active_apps = Application.query.filter_by(job_id=job_id).count()
 
@@ -1552,33 +1315,26 @@ def delete_job(job_id):
         )
         return redirect(url_for('recruiter.edit_job', job_id=job_id))
 
-    # Delete gallery images
-    for image in job.images:
-        file_path = os.path.join(
-            current_app.root_path, "static", "uploads", "job_posters", image.image_path
-        )
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        db.session.delete(image)
+    ok, error = delete_job_completely(job_id)
+    if ok:
+        flash("Job deleted successfully!", "success")
+    else:
+        flash(f"Deletion failed: {error}", "danger")
 
-    # Delete cover photo
-    if job.cover_photo:
-        cover_path = os.path.join(
-            current_app.root_path, "static", "uploads", "job_covers", job.cover_photo
-        )
-        if os.path.exists(cover_path):
-            os.remove(cover_path)
-
-    db.session.delete(job)
-    db.session.commit()
-
-    flash("Job deleted successfully!", "success")
     return redirect(url_for('recruiter.my_job_list'))
 
 
-# ===============================
+# ==============================================================
 # FORCE DELETE JOB  (AJAX)
-# ===============================
+#
+# ── FIX #1 / #3 ──────────────────────────────────────────────
+# BEFORE: ~120 lines of raw SQL duplicating the same 13-step FK
+#   cleanup that admin.py's job-deletion path (inside delete_user())
+#   already implemented independently.
+# AFTER: thin wrapper around the shared service — one FK-order
+#   definition for the whole app instead of two that could silently
+#   drift apart.
+# ==============================================================
 @recruiter_bp.route('/force-delete-job/<int:job_id>', methods=['POST'])
 @login_required
 def force_delete_job(job_id):
@@ -1590,132 +1346,11 @@ def force_delete_job(job_id):
     if job.company_id != current_user.id:
         return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
-    try:
-        from sqlalchemy import text
+    ok, error = delete_job_completely(job_id)
+    if not ok:
+        return jsonify({'success': False, 'error': error}), 500
 
-        # 1. Delete resignation requests tied to employees of this job
-        db.session.execute(text("""
-            DELETE FROM resignation_request
-            WHERE job_id = :job_id
-            OR employee_id IN (
-                SELECT id FROM employee WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 2. Delete employees tied to this job's applications
-        db.session.execute(text("""
-            DELETE FROM employee
-            WHERE job_id = :job_id
-            OR application_id IN (
-                SELECT id FROM application WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 3. Delete employment onboarding records
-        db.session.execute(text("""
-            DELETE FROM employment_onboarding
-            WHERE application_id IN (
-                SELECT id FROM application WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 4. Delete employment submissions
-        db.session.execute(text("""
-            DELETE FROM employment_submission
-            WHERE application_id IN (
-                SELECT id FROM application WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 5. Delete employment requirements
-        db.session.execute(text("""
-            DELETE FROM employment_requirement WHERE job_id = :job_id
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 6. Delete applicant notifications
-        db.session.execute(text("""
-            DELETE FROM applicant_notification
-            WHERE job_id = :job_id
-            OR application_id IN (
-                SELECT id FROM application WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-
-        # 7. Delete recruiter notifications
-        db.session.execute(text("""
-            DELETE FROM recruiter_notification
-            WHERE job_id = :job_id
-            OR application_id IN (
-                SELECT id FROM application WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-
-        # 8. Delete HR notifications
-        db.session.execute(text("""
-            DELETE FROM hr_notification
-            WHERE job_id = :job_id
-            OR application_id IN (
-                SELECT id FROM application WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 9. Delete job team members
-        db.session.execute(text("""
-            DELETE FROM job_team_member WHERE job_id = :job_id
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 10. Delete saved jobs
-        db.session.execute(text("""
-            DELETE FROM saved_job WHERE job_id = :job_id
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 11. Remove gallery images from disk
-        for image in job.images:
-            file_path = os.path.join(
-                current_app.root_path, "static", "uploads", "job_posters", image.image_path
-            )
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            db.session.delete(image)
-
-        # 12. Remove cover photo from disk
-        if job.cover_photo:
-            cover_path = os.path.join(
-                current_app.root_path, "static", "uploads", "job_covers", job.cover_photo
-            )
-            if os.path.exists(cover_path):
-                os.remove(cover_path)
-
-        # 13. Delete HR feedback tied to this job's applications
-        db.session.execute(text("""
-            DELETE FROM hr_feedback
-            WHERE application_id IN (
-                SELECT id FROM application WHERE job_id = :job_id
-            )
-        """), {"job_id": job_id})
-        db.session.flush()
-
-        # 14. Delete applications, then the job itself
-        db.session.execute(text("""
-            DELETE FROM application WHERE job_id = :job_id
-        """), {"job_id": job_id})
-
-        db.session.delete(job)
-        db.session.commit()
-
-        return jsonify({'success': True})
-
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': str(e)}), 500
+    return jsonify({'success': True})
 
 
 # ===============================
@@ -1807,7 +1442,6 @@ def clear_all_notifications_api():
 
 # ===============================
 # UPLOAD COMPANY PROOF  (from banner)
-# Add this route to recruiter.py alongside the other upload routes
 # ===============================
 @recruiter_bp.route('/upload-company-proof', methods=['POST'])
 @login_required

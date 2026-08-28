@@ -7,13 +7,12 @@ from flask import jsonify
 from datetime import datetime, timedelta
 from models import AdminNotification, db, User, ApplicantProfile, get_ph_time
 
-# ── FIX #1 / #3: shared deletion logic instead of ~150 lines of
+# FIX: Shared deletion logic instead of ~150 lines of
 # inline nested helper functions duplicated across admin.py,
 # settings.py, and recruiter.py. See services/deletion_service.py.
 from services.deletion_service import delete_user_completely
 
 admin_bp = Blueprint('admin', __name__, url_prefix="/admin")
-
 
 # ==============================
 # Secret Admin Login Page
