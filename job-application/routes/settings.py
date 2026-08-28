@@ -4,10 +4,15 @@ Settings routes for Applicant, HR, and Recruiter roles.
 """
 
 from flask import Blueprint, render_template, request, jsonify, redirect, url_for, flash, current_app
-from flask_login import login_required, current_user
+from flask_login import login_required, current_user, logout_user
 from models import db, UserSettings
 from werkzeug.security import check_password_hash, generate_password_hash
 import json
+
+# ── FIX #1 / #3: shared deletion logic instead of ~250 lines of
+# duplicated helper functions (nearly identical to admin.py's copy).
+# See services/deletion_service.py for the single source of truth.
+from services.deletion_service import delete_user_completely
 
 settings_bp = Blueprint('settings', __name__, url_prefix='/settings')
 
@@ -139,9 +144,14 @@ def save_settings():
                                 follower_id=req.sender_id,
                                 followed_id=current_user.id
                             ))
-            except Exception as e:
-                # Never let the follow-request logic crash the whole save
-                print(f'[settings] follow-request auto-accept error: {e}')
+            except Exception:
+                # FIX #5: was `except Exception as e: print(...)` — now
+                # goes through the app logger with a full traceback so
+                # it's visible in production monitoring, not just a
+                # local console that nobody's watching.
+                current_app.logger.exception(
+                    f"[settings.save_settings] follow-request auto-accept error for user_id={current_user.id}"
+                )
 
     # ── Notifications ─────────────────────────────────────────
     elif section == 'notifications':
@@ -207,10 +217,14 @@ def save_settings():
     try:
         db.session.commit()
         return jsonify({'success': True})
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        import traceback
-        traceback.print_exc()
+        # FIX #5: was print(traceback) via `import traceback; traceback.print_exc()`
+        # — now logged through current_app.logger so it goes wherever the
+        # rest of the app's logging is actually configured to go.
+        current_app.logger.exception(
+            f"[settings.save_settings] DB error saving section={section} for user_id={current_user.id}"
+        )
         return jsonify({'success': False, 'message': 'Database error. Please try again.'}), 500
 
 
@@ -240,8 +254,7 @@ def deactivate_account():
     if not _role_allowed():
         return jsonify({'success': False}), 403
 
-    from flask_login import logout_user
-    from models import User                    
+    from models import User
 
     user = db.session.get(User, current_user.id)
     user.is_deactivated = True
@@ -250,9 +263,23 @@ def deactivate_account():
     logout_user()
     return jsonify({'success': True})
 
-# ─────────────────────────────────────────────────────────────
+
+# ==============================================================
 #  POST /settings/delete-account
-# ─────────────────────────────────────────────────────────────
+#
+# ── FIX #1 / #3 ──────────────────────────────────────────────
+# BEFORE: ~250 lines of nested helper functions
+#   (_delete_upload, _delete_user_files, _delete_job_files, _run,
+#   _delete_user_data) almost identical to admin.py's delete_user()
+#   — including the recruiter-specific branch that deletes owned
+#   jobs and HR sub-accounts.
+# AFTER: the whole cascade now lives once in
+#   services/deletion_service.py. This route keeps only what's
+#   specific to a SELF-service deletion: verifying the caller's own
+#   password before proceeding, and logging them out only after a
+#   confirmed successful commit (so a failed delete doesn't lock
+#   the user out of a still-existing account).
+# ==============================================================
 @settings_bp.route('/delete-account', methods=['POST'])
 @login_required
 def delete_account():
@@ -270,435 +297,18 @@ def delete_account():
             return jsonify({'success': False, 'message': 'Incorrect password.'}), 400
 
     user_id = current_user.id
-    role    = current_user.role
 
-    try:
-        from sqlalchemy import text
-        import os
+    ok, error = delete_user_completely(user_id)
 
-        uid = user_id
+    if not ok:
+        return jsonify({'success': False, 'message': f'Could not delete account: {error}'}), 500
 
-        # ══════════════════════════════════════════════
-        # Helper: delete a single file from disk
-        # ══════════════════════════════════════════════
-        def _delete_upload(subfolder, filename):
-            if not filename:
-                return
-            if filename.startswith('http'):
-                return
-            path = os.path.join(current_app.root_path, 'static', 'uploads', subfolder, filename)
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception as e:
-                    print(f'[DELETE FILE] Failed to remove {path}: {e}')
-
-        # ══════════════════════════════════════════════
-        # Helper: delete all disk files for a user_id
-        # ══════════════════════════════════════════════
-        def _delete_user_files(target_uid):
-
-            # Profile picture
-            u_row = db.session.execute(
-                text("SELECT profile_picture FROM user WHERE id = :u"),
-                {'u': target_uid}
-            ).fetchone()
-            if u_row and u_row[0]:
-                _delete_upload('profile_pictures', u_row[0])
-
-            # Applicant profile files
-            ap = db.session.execute(
-                text("SELECT resume_file, portfolio_file FROM applicant_profile WHERE user_id = :u"),
-                {'u': target_uid}
-            ).fetchone()
-            if ap:
-                _delete_upload('resumes',    ap[0])
-                _delete_upload('portfolios', ap[1])
-
-            # Work experience certificates
-            cert_rows = db.session.execute(text("""
-                SELECT wec.file_path
-                FROM work_experience_certificate wec
-                JOIN work_experience we ON we.id = wec.experience_id
-                JOIN applicant_profile ap ON ap.id = we.profile_id
-                WHERE ap.user_id = :u
-            """), {'u': target_uid}).fetchall()
-            for cert in cert_rows:
-                _delete_upload('work_certificates', cert[0])
-
-            # Recruiter profile files
-            rp = db.session.execute(
-                text("SELECT company_logo, company_proof, portfolio_file FROM recruiter_profile WHERE user_id = :u"),
-                {'u': target_uid}
-            ).fetchone()
-            if rp:
-                _delete_upload('company_logos',  rp[0])
-                _delete_upload('company_proofs', rp[1])
-                _delete_upload('portfolios',     rp[2])
-
-            # HR profile files
-            hp = db.session.execute(
-                text("SELECT portfolio_file FROM hr_profile WHERE user_id = :u"),
-                {'u': target_uid}
-            ).fetchone()
-            if hp and hp[0]:
-                _delete_upload('portfolios', hp[0])
-
-            # User report evidence files
-            report_rows = db.session.execute(
-                text("SELECT evidence_files FROM user_report WHERE reporter_id = :u OR reported_id = :u"),
-                {'u': target_uid}
-            ).fetchall()
-            for r in report_rows:
-                if r[0]:
-                    import json
-                    try:
-                        files = json.loads(r[0])
-                        if isinstance(files, list):
-                            for f in files:
-                                _delete_upload('report_evidence', f)
-                        else:
-                            _delete_upload('report_evidence', r[0])
-                    except (json.JSONDecodeError, TypeError):
-                        _delete_upload('report_evidence', r[0])
-
-            # Employment submission files
-            sub_rows = db.session.execute(text("""
-                SELECT es.file_path
-                FROM employment_submission es
-                JOIN application a ON a.id = es.application_id
-                WHERE a.applicant_id = :uid
-            """), {"uid": target_uid}).fetchall()
-            for row in sub_rows:
-                if row[0]:
-                    _delete_upload('employment_submissions', row[0])
-
-            # FIX: Apply-time resume files (stored on application.resume,
-            # separate from applicant_profile.resume_file — never cleaned before)
-            app_resume_rows = db.session.execute(text("""
-                SELECT resume FROM application
-                WHERE applicant_id = :uid AND resume IS NOT NULL AND resume != ''
-            """), {"uid": target_uid}).fetchall()
-            for row in app_resume_rows:
-                if row[0]:
-                    _delete_upload('resumes', row[0])
-
-            # Resignation letter files
-            resign_rows = db.session.execute(text("""
-                SELECT letter_file FROM resignation_request
-                WHERE applicant_id = :uid
-                OR employee_id IN (SELECT id FROM employee WHERE user_id = :uid)
-            """), {"uid": target_uid}).fetchall()
-            for row in resign_rows:
-                if row[0]:
-                    _delete_upload('resignation_letters', row[0])
-
-        # ══════════════════════════════════════════════
-        # Helper: delete all disk files for a job_id
-        # ══════════════════════════════════════════════
-        def _delete_job_files(job_id):
-            img_rows = db.session.execute(
-                text("SELECT image_path FROM job_image WHERE job_id = :jid"),
-                {'jid': job_id}
-            ).fetchall()
-            for r in img_rows:
-                _delete_upload('job_posters', r[0])
-
-            cover = db.session.execute(
-                text("SELECT cover_photo FROM job WHERE id = :jid"),
-                {'jid': job_id}
-            ).fetchone()
-            if cover and cover[0]:
-                _delete_upload('job_covers', cover[0])
-
-            # Submission files for this job's requirements
-            sub_rows = db.session.execute(text("""
-                SELECT es.file_path FROM employment_submission es
-                JOIN employment_requirement er ON er.id = es.requirement_id
-                WHERE er.job_id = :jid
-            """), {"jid": job_id}).fetchall()
-            for row in sub_rows:
-                if row[0]:
-                    _delete_upload('employment_submissions', row[0])
-
-            # Resignation letters for this job
-            resign_rows = db.session.execute(text("""
-                SELECT letter_file FROM resignation_request WHERE job_id = :jid
-            """), {"jid": job_id}).fetchall()
-            for row in resign_rows:
-                if row[0]:
-                    _delete_upload('resignation_letters', row[0])
-
-        # ══════════════════════════════════════════════
-        # Helper: shorthand SQL executor with flush
-        # ══════════════════════════════════════════════
-        def _run(sql, **kw):
-            db.session.execute(text(sql), kw)
-            db.session.flush()
-
-        # ══════════════════════════════════════════════
-        # Helper: delete every DB row referencing
-        # target_uid, in strict FK order.
-        # ══════════════════════════════════════════════
-        def _delete_user_data(target_uid):
-            u = target_uid
-
-            # 1. Break message reply_to_id self-ref FIRST
-            _run("""UPDATE message SET reply_to_id = NULL
-                    WHERE reply_to_id IN (
-                        SELECT id FROM (
-                            SELECT id FROM message
-                            WHERE sender_id = :u OR receiver_id = :u
-                        ) AS _m
-                    )""", u=u)
-
-            # 2. Message reactions
-            _run("""DELETE FROM message_reaction
-                    WHERE user_id = :u
-                       OR message_id IN (
-                           SELECT id FROM (
-                               SELECT id FROM message
-                               WHERE sender_id = :u OR receiver_id = :u
-                           ) AS _m2
-                       )""", u=u)
-
-            # 3. Messages
-            _run("DELETE FROM message WHERE sender_id = :u OR receiver_id = :u", u=u)
-
-            # 4. Follows & follow requests
-            _run("DELETE FROM follow_request WHERE sender_id = :u OR receiver_id = :u", u=u)
-            _run("DELETE FROM follow WHERE follower_id = :u OR followed_id = :u", u=u)
-
-            # 5. User blocks
-            _run("DELETE FROM user_block WHERE blocker_id = :u OR blocked_id = :u", u=u)
-
-            # 6. User reports — NULL reviewed_by first to avoid FK error
-            _run("UPDATE user_report SET reviewed_by = NULL WHERE reviewed_by = :u", u=u)
-            _run("DELETE FROM user_report WHERE reporter_id = :u OR reported_id = :u", u=u)
-
-            # 7. Saved jobs (as applicant)
-            _run("DELETE FROM saved_job WHERE applicant_id = :u", u=u)
-
-            # 8. Job team memberships (as HR)
-            _run("DELETE FROM job_team_member WHERE hr_id = :u", u=u)
-
-            # 9. HR feedback written by this user
-            _run("DELETE FROM hr_feedback WHERE hr_id = :u", u=u)
-
-            # 10. NULL employee.confirmed_by (FK — can't delete yet)
-            _run("UPDATE employee SET confirmed_by = NULL WHERE confirmed_by = :u", u=u)
-
-            # 11. NULL resignation_request.reviewed_by
-            _run("UPDATE resignation_request SET reviewed_by = NULL WHERE reviewed_by = :u", u=u)
-
-            # 12. Resignation requests where this user IS the applicant
-            _run("DELETE FROM resignation_request WHERE applicant_id = :u", u=u)
-            _run("""DELETE FROM resignation_request
-                    WHERE employee_id IN (
-                        SELECT id FROM employee
-                        WHERE user_id = :u
-                           OR application_id IN (
-                               SELECT id FROM application WHERE applicant_id = :u
-                           )
-                    )""", u=u)
-
-            # 13. Employee records
-            _run("""DELETE FROM employee
-                    WHERE user_id = :u
-                       OR application_id IN (
-                           SELECT id FROM application WHERE applicant_id = :u
-                       )""", u=u)
-
-            # 14. Employment onboarding
-            _run("""DELETE FROM employment_onboarding
-                    WHERE application_id IN (
-                        SELECT id FROM application WHERE applicant_id = :u
-                    )""", u=u)
-
-            # 15. Employment submissions
-            _run("""DELETE FROM employment_submission
-                    WHERE application_id IN (
-                        SELECT id FROM application WHERE applicant_id = :u
-                    )""", u=u)
-
-            # 16. HR feedback ON this user's applications
-            _run("""DELETE FROM hr_feedback
-                    WHERE application_id IN (
-                        SELECT id FROM application WHERE applicant_id = :u
-                    )""", u=u)
-
-            # 17. All notifications — both as owner AND as sender_id,
-            # including recruiter_notification and hr_notification rows
-            # that reference this user's applications via application_id.
-            # Without the application_id subquery on these two, deleting
-            # the application rows in step 18 crashes on MySQL (FK violation).
-            _run("""DELETE FROM applicant_notification
-                    WHERE applicant_id = :u
-                       OR sender_id    = :u
-                       OR application_id IN (
-                           SELECT id FROM application WHERE applicant_id = :u
-                       )""", u=u)
-            _run("""DELETE FROM recruiter_notification
-                    WHERE recruiter_id = :u
-                       OR sender_id    = :u
-                       OR application_id IN (
-                           SELECT id FROM application WHERE applicant_id = :u
-                       )""", u=u)
-            _run("""DELETE FROM hr_notification
-                    WHERE hr_id     = :u
-                       OR sender_id = :u
-                       OR application_id IN (
-                           SELECT id FROM application WHERE applicant_id = :u
-                       )""", u=u)
-            _run("DELETE FROM admin_notifications WHERE user_id = :u", u=u)
-
-            # 18. This user's own applications
-            _run("DELETE FROM application WHERE applicant_id = :u", u=u)
-
-            # 19. Applicant profile chain
-            _run("""DELETE FROM work_experience_certificate
-                    WHERE experience_id IN (
-                        SELECT id FROM work_experience
-                        WHERE profile_id IN (
-                            SELECT id FROM applicant_profile WHERE user_id = :u
-                        )
-                    )""", u=u)
-            _run("""DELETE FROM work_experience
-                    WHERE profile_id IN (
-                        SELECT id FROM applicant_profile WHERE user_id = :u
-                    )""", u=u)
-            _run("""DELETE FROM applicant_education
-                    WHERE profile_id IN (
-                        SELECT id FROM applicant_profile WHERE user_id = :u
-                    )""", u=u)
-            _run("""DELETE FROM skill
-                    WHERE profile_id IN (
-                        SELECT id FROM applicant_profile WHERE user_id = :u
-                    )""", u=u)
-            _run("""DELETE FROM project
-                    WHERE profile_id IN (
-                        SELECT id FROM applicant_profile WHERE user_id = :u
-                    )""", u=u)
-            _run("""DELETE FROM certification
-                    WHERE profile_id IN (
-                        SELECT id FROM applicant_profile WHERE user_id = :u
-                    )""", u=u)
-            _run("DELETE FROM applicant_profile WHERE user_id = :u", u=u)
-
-            # 20. Recruiter profile chain
-            _run("""DELETE FROM recruiter_education
-                    WHERE profile_id IN (
-                        SELECT id FROM recruiter_profile WHERE user_id = :u
-                    )""", u=u)
-            _run("DELETE FROM recruiter_profile WHERE user_id = :u", u=u)
-
-            # 21. HR profile chain
-            _run("""DELETE FROM hr_education
-                    WHERE profile_id IN (
-                        SELECT id FROM hr_profile WHERE user_id = :u
-                    )""", u=u)
-            _run("DELETE FROM hr_profile WHERE user_id = :u", u=u)
-
-            # 22. User settings
-            _run("DELETE FROM user_settings WHERE user_id = :u", u=u)
-
-        # ══════════════════════════════════════════════
-        # RECRUITER: delete all owned jobs + all HR accs
-        # ══════════════════════════════════════════════
-        if role == 'recruiter':
-
-            # NULL FK cols that reference this recruiter before job deletes
-            _run("UPDATE employee SET confirmed_by = NULL WHERE confirmed_by = :u", u=uid)
-            _run("UPDATE resignation_request SET reviewed_by = NULL WHERE reviewed_by = :u", u=uid)
-
-            # Collect HR accounts this recruiter created
-            hr_rows = db.session.execute(
-                text("SELECT id FROM user WHERE created_by = :u AND role = 'hr'"),
-                {'u': uid}
-            ).fetchall()
-            hr_ids = [row[0] for row in hr_rows]
-
-            # Delete each owned job: disk files first, then all child DB rows, then the job row
-            job_rows = db.session.execute(
-                text("SELECT id FROM job WHERE company_id = :u"), {'u': uid}
-            ).fetchall()
-
-            for (job_id,) in job_rows:
-                _delete_job_files(job_id)
-
-                for sql in [
-                    "DELETE FROM resignation_request WHERE job_id = :jid",
-                    "DELETE FROM applicant_notification WHERE job_id = :jid OR application_id IN (SELECT id FROM application WHERE job_id = :jid)",
-                    "DELETE FROM recruiter_notification WHERE job_id = :jid OR application_id IN (SELECT id FROM application WHERE job_id = :jid)",
-                    "DELETE FROM hr_notification       WHERE job_id = :jid OR application_id IN (SELECT id FROM application WHERE job_id = :jid)",
-                    """DELETE FROM resignation_request
-                       WHERE employee_id IN (
-                           SELECT id FROM employee
-                           WHERE application_id IN (SELECT id FROM application WHERE job_id = :jid)
-                       )""",
-                    """DELETE FROM employee
-                       WHERE job_id = :jid
-                          OR application_id IN (SELECT id FROM application WHERE job_id = :jid)""",
-                    "DELETE FROM employment_onboarding  WHERE application_id IN (SELECT id FROM application WHERE job_id = :jid)",
-                    """DELETE FROM employment_submission
-                       WHERE application_id IN (SELECT id FROM application WHERE job_id = :jid)
-                          OR requirement_id IN (SELECT id FROM employment_requirement WHERE job_id = :jid)""",
-                    "DELETE FROM hr_feedback            WHERE application_id IN (SELECT id FROM application WHERE job_id = :jid)",
-                    "DELETE FROM employment_requirement WHERE job_id = :jid",
-                    "DELETE FROM saved_job              WHERE job_id = :jid",
-                    "DELETE FROM job_team_member        WHERE job_id = :jid",
-                    "DELETE FROM application            WHERE job_id = :jid",
-                    "DELETE FROM job_image              WHERE job_id = :jid",
-                ]:
-                    db.session.execute(text(sql), {'jid': job_id})
-                    db.session.flush()
-
-                db.session.execute(text("DELETE FROM job WHERE id = :jid"), {'jid': job_id})
-                db.session.flush()
-
-            # Delete recruiter's own notifications (owned + as sender)
-            _run("DELETE FROM recruiter_notification WHERE recruiter_id = :u OR sender_id = :u", u=uid)
-
-            # Delete each owned HR account: disk files first, then DB data, then user row
-            for hr_uid in hr_ids:
-                _delete_user_files(hr_uid)
-                _delete_user_data(hr_uid)
-                _run("UPDATE user SET created_by = NULL WHERE created_by = :u", u=hr_uid)
-                _run("UPDATE user SET deleted_by = NULL WHERE deleted_by = :u", u=hr_uid)
-                _run("DELETE FROM user WHERE id = :u", u=hr_uid)
-
-        # ══════════════════════════════════════════════
-        # Delete the main user's disk files BEFORE
-        # _delete_user_data() wipes the profile rows
-        # ══════════════════════════════════════════════
-        _delete_user_files(uid)
-
-        # ══════════════════════════════════════════════
-        # Delete the main user's own DB data
-        # ══════════════════════════════════════════════
-        _delete_user_data(uid)
-
-        # NULL self-referential user FKs before deleting the row
-        _run("UPDATE user SET created_by = NULL WHERE created_by = :u", u=uid)
-        _run("UPDATE user SET deleted_by = NULL WHERE deleted_by = :u", u=uid)
-
-        # Delete the user row itself
-        _run("DELETE FROM user WHERE id = :u", u=uid)
-
-        # Commit first, THEN logout — if commit fails, user stays logged in
-        # and can retry rather than being locked out of a still-existing account
-        db.session.commit()
-
-        from flask_login import logout_user
-        logout_user()
-
-        return jsonify({'success': True})
-
-    except Exception as e:
-        db.session.rollback()
-        import traceback
-        traceback.print_exc()
-        return jsonify({'success': False, 'message': f'Could not delete account: {str(e)}'}), 500
+    # Commit already happened inside the service; only log the user
+    # out on confirmed success — mirrors the original ordering
+    # rationale: "if commit fails, user stays logged in and can retry
+    # rather than being locked out of a still-existing account."
+    logout_user()
+    return jsonify({'success': True})
 
 
 # ─────────────────────────────────────────────────────────────
